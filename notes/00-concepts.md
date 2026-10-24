@@ -1,6 +1,6 @@
 # 00 · Concepts: How a decoder-only LLM runs at inference time
 
-> Phase 0 of `llm-serving-lab` · 2026-10-17
+> Phase 0 of `llm-serving-lab` · 2026-10-17 (Q3–Q5 added 2026-10-21)
 > Goal: understand enough of the transformer and the inference process to read Nano-vLLM and Mini-SGLang next week.
 > Reference model: **Qwen3-0.6B** ([config.json](https://huggingface.co/Qwen/Qwen3-0.6B/blob/main/config.json))
 
@@ -174,15 +174,86 @@ Qwen3-0.6B: $L = 28$, $H_{kv} = 8$, $d_{head} = 128$, $b = 2$ (bf16)
 
 ### Q3. What problem does PagedAttention solve?
 
-**TODO** — read vLLM paper sections 1–3.
+Contiguous, max-length KV allocation wastes **60–80%** of KV memory. PagedAttention splits the KV cache into **fixed-size blocks** (16 tokens in vLLM) allocated **on demand**, with a per-request **block table** mapping logical blocks to non-contiguous physical blocks. Waste is limited to each request's last, partially filled block (**< 4%** overall), so far more requests fit in memory.
 
-### Q4. Continuous batching vs static batching?
+| Waste before PagedAttention | What it is |
+|---|---|
+| Reservation | memory held for tokens that haven't been generated yet |
+| Internal fragmentation | reserved for 4,096 tokens, request only uses 600 |
+| External fragmentation | gaps between differently sized reservations — too small to fit a new request |
 
-**TODO**
+The idea is OS paging applied to the KV cache:
+
+| Operating system | PagedAttention | DE analogy |
+|---|---|---|
+| process | request (sequence) | a file |
+| page | KV block | HDFS block |
+| byte | **token** | a row |
+| page table | **block table** | NameNode metadata |
+| physical memory | KV cache in GPU memory | data on DataNodes |
+
+**My sizing** (22.8 GB for KV, 112 KB/token, max 4,096, average request 600 tokens, block = 16 tokens):
+
+| | Reserve max length | PagedAttention |
+|---|---|---|
+| Memory per request | 4,096 × 112 KB = 448 MB | ⌈600/16⌉ = 38 blocks = 608 slots ≈ 66.5 MB |
+| Waste | (4,096 − 600) / 4,096 ≈ **85%** | 8 empty slots in the last block ≈ **1.3%** |
+| Concurrent requests | ≈ **52** | ≈ **351** (≈ 6.75×) |
+
+**Why round up to 38 blocks?** A block is the smallest unit of allocation. 37 blocks hold 592 tokens; the last 8 still need a home, so a whole 38th block is allocated and half of it stays empty. Waste per request is always under one block.
+
+**Block size is a trade-off.** Bigger blocks → shorter block tables and more efficient kernels, but more tail waste and coarser prefix sharing. vLLM uses 16 tokens; SGLang originally used 1-token pages.
+
+**Copy-on-write.** When several outputs are sampled from one prompt, they share the prompt's physical blocks (reference counted). A block is copied only when one sequence needs to write into a shared block. (OS: `fork()`; DE: BigQuery table clones / git branches.)
+
+**Mistakes I made:** mapped OS *byte* → byte (it's *token*) and *page table* → KV cache (it's the *block table*); described the block table as "pretending to reserve max length" — there is no reservation at all, allocation is on demand.
+
+### Q4. How does continuous batching differ from static batching?
+
+**Static batching** runs a fixed group until *every* request in it finishes. Slots of finished requests sit idle and queued requests wait, so the batch runs at the pace of its longest request. **Continuous batching** (iteration-level scheduling, from Orca) re-schedules at **every decode step**: when a request emits EOS, the scheduler admits a waiting request into the freed slot immediately.
+
+**My hand simulation** — 2 slots; output lengths A = 2, B = 8, C = 3, D = 5:
+
+```
+Static:      slot1  A A – – – – – – | C C C – –
+             slot2  B B B B B B B B | D D D D D      → 13 steps, 8 idle slot-steps
+Continuous:  slot1  A A C C C D D D D D
+             slot2  B B B B B B B B – –              → 10 steps, 2 idle slot-steps
+```
+
+| | Static | Continuous |
+|---|---|---|
+| Decode steps | 13 | **10** |
+| Slot utilization | 18/26 ≈ 69% | 18/20 = **90%** |
+| C starts / finishes | step 9 / 11 | **step 3 / 5** |
+
+**Trade-off:** admitting a new request requires a prefill, which briefly stalls running decodes (TTFT vs TPOT; TGI exposes this as `waiting_served_ratio`). Requests joining and leaving at every step also make KV memory allocation dynamic — which is why continuous batching needs PagedAttention.
+
+**How they fit together:** continuous batching keeps every step full; PagedAttention lets more requests fit in memory so each step can be bigger. In Anyscale's benchmark at QPS = 4, only vLLM (both techniques) kept p50 latency flat (~6 s); continuous batching alone rose to ~33 s.
+
+**Mistake I made:** said static batching mainly wastes *memory*. It mainly wastes **GPU compute** (idle slots) and **queueing time**.
 
 ### Q5. What computation does prefix caching / RadixAttention save?
 
-**TODO** — read SGLang paper, RadixAttention section.
+It eliminates **redundant prefill** of shared prefixes — system prompts, tool definitions, multi-turn history — and **duplicate KV storage**. A request whose tokens match a cached prefix **exactly from the first token** reuses that KV instead of recomputing it. Correctness follows from the causal mask: a prefix's K/V depend only on the prefix itself.
+
+Example: 50 requests sharing a 2,000-token system prompt → ~10.7 GB of KV without sharing vs ~219 MB with sharing, and that prefix disappears from every request's prefill (lower TTFT).
+
+**Prefix caching** is the technique; **RadixAttention** is SGLang's implementation of it.
+
+| | vLLM (Automatic Prefix Caching) | SGLang (RadixAttention) |
+|---|---|---|
+| Lookup structure | hash table | radix tree over token sequences |
+| Key | hash of a full block's tokens + the hash of everything before it | path from the root = the prefix |
+| Match granularity | full blocks only (16 tokens) | any token (1-token pages) |
+| Eviction | LRU over unused blocks | LRU over leaf nodes not used by any running request |
+| Scheduling | — | **cache-aware**: admit requests with the longest cached prefix first |
+
+The prefix must be part of a block's key because the same 16 tokens after a different prefix produce **different** K/V. **Matching granularity follows page size:** with 16-token pages you can't share 10 tokens of a page.
+
+**Cache-aware scheduling** skips redundant prefill and keeps hot prefixes from being evicted, at some cost in fairness. It reduces *how much* work is done, not kernel efficiency (that depends on page size / memory layout). DE analogy: Spark's locality-aware scheduling.
+
+**Mistake I made:** framed vLLM vs SGLang as "PagedAttention vs radix tree". Both page KV memory; the real difference is **how they find a reusable prefix** (hash table vs radix tree).
 
 ## 4. The one idea that ties serving together
 
@@ -240,3 +311,6 @@ This design is **Grouped-Query Attention (GQA)**: the 16 query heads are split i
 - Vaswani et al., [Attention Is All You Need](https://arxiv.org/abs/1706.03762) (2017)
 - Kwon et al., [PagedAttention / vLLM](https://arxiv.org/abs/2309.06180) (2023)
 - Zheng et al., [SGLang / RadixAttention](https://arxiv.org/abs/2312.07104) (2023)
+- vLLM blog, [vLLM: Easy, Fast, and Cheap LLM Serving with PagedAttention](https://blog.vllm.ai/2023/06/20/vllm.html) (2023)
+- Anyscale, [How continuous batching enables 23x throughput in LLM inference](https://www.anyscale.com/blog/continuous-batching-llm-inference) (2023)
+- LMSYS, [Fast and Expressive LLM Inference with RadixAttention and SGLang](https://lmsys.org/blog/2024-01-17-sglang/) (2024)
